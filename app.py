@@ -1,8 +1,8 @@
-"""UPI Key Store — MongoDB persistent + real panel keys + auto poll."""
+"""UPI Key Store — MongoDB persistent (crash-safe)."""
 import os, secrets, json, string
 from pathlib import Path
 from datetime import datetime, timedelta
-from urllib.parse import quote, quote_plus
+from urllib.parse import quote
 from typing import Optional, Tuple, List, Any
 
 from fastapi import FastAPI, Request, Form, HTTPException, Depends, status
@@ -11,8 +11,18 @@ from fastapi.templating import Jinja2Templates
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from mangum import Mangum
 import httpx
-from pymongo import MongoClient, ASCENDING, DESCENDING, ReturnDocument
-from bson import ObjectId
+
+# Lazy / safe pymongo import
+try:
+    from pymongo import MongoClient, ASCENDING, DESCENDING, ReturnDocument
+    from bson import ObjectId
+    HAS_MONGO = True
+except ImportError as _e:
+    HAS_MONGO = False
+    MongoClient = None
+    ObjectId = None
+    ASCENDING = DESCENDING = ReturnDocument = None
+    _MONGO_IMPORT_ERR = str(_e)
 
 UPI_ID = os.getenv("UPI_ID", "")
 API_KEY = os.getenv("API_KEY", "")
@@ -29,7 +39,7 @@ _tpl_dir.mkdir(parents=True, exist_ok=True)
 for _n, _c in _TEMPLATES.items():
     (_tpl_dir / _n).write_text(_c, encoding="utf-8")
 
-# ===== PANEL CLIENT =====
+# ===== PANEL =====
 
 
 class PanelError(Exception):
@@ -183,51 +193,10 @@ async def test_connection(panel_url: str, username: str, password: str) -> str:
     """Verify credentials by minting a real 1-hour key."""
     return await generate_key(panel_url, username, password, hours=1, name="STORE-TEST")
 
-# ===== DATABASE (MongoDB) =====
-
-
-MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
-_client: Optional[MongoClient] = None
+# ===== MONGO DB =====
+_client = None
 _db = None
 
-
-def _get_db():
-    global _client, _db
-    if _db is not None:
-        return _db
-    if not MONGODB_URI:
-        raise RuntimeError("MONGODB_URI env var is not set")
-    _client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=8000)
-    # Use dedicated db name
-    _db = _client.get_default_database()
-    if _db.name == "test" or not _db.name:
-        _db = _client["keystore"]
-    return _db
-
-
-def _oid(v) -> Optional[ObjectId]:
-    if v is None:
-        return None
-    if isinstance(v, ObjectId):
-        return v
-    try:
-        return ObjectId(str(v))
-    except Exception:
-        return None
-
-
-def _doc_id(doc: dict) -> dict:
-    """Normalize Mongo doc to use integer-like 'id' string for templates."""
-    if not doc:
-        return doc
-    d = dict(doc)
-    if "_id" in d:
-        d["id"] = str(d["_id"])
-        del d["_id"]
-    return d
-
-
-# Default plans for Panel method
 DEFAULT_PANEL_PLANS = [
     ("5 Hours", 5, 39),
     ("12 Hours", 12, 79),
@@ -238,216 +207,168 @@ DEFAULT_PANEL_PLANS = [
     ("30 Days", 720, 899),
 ]
 
+def _get_db():
+    global _client, _db
+    if _db is not None:
+        return _db
+    if not HAS_MONGO:
+        raise RuntimeError("pymongo not installed: " + globals().get("_MONGO_IMPORT_ERR", ""))
+    if not MONGODB_URI:
+        raise RuntimeError("MONGODB_URI env var is not set on Vercel")
+    _client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=10000)
+    # Always use fixed db name (URI often has no db path)
+    _db = _client["keystore"]
+    return _db
+
+def _oid(v):
+    if v is None or ObjectId is None:
+        return None
+    if isinstance(v, ObjectId):
+        return v
+    try:
+        return ObjectId(str(v))
+    except Exception:
+        return None
+
+def _doc_id(doc):
+    if not doc:
+        return doc
+    d = dict(doc)
+    if "_id" in d:
+        d["id"] = str(d["_id"])
+        del d["_id"]
+    return d
 
 async def init_db():
     db = _get_db()
-    # indexes
     db.products.create_index([("is_active", ASCENDING)])
     db.variants.create_index([("product_id", ASCENDING)])
-    db.keys.create_index([("product_id", ASCENDING), ("variant_id", ASCENDING), ("status", ASCENDING)])
+    db.keys.create_index([("product_id", ASCENDING), ("status", ASCENDING)])
     db.orders.create_index([("order_id", ASCENDING)], unique=True)
 
-
-# ── Products ──────────────────────────────────────────────
-async def add_product(name: str, ptype: str, description: str = "",
-                      panel_url: str = "", panel_user: str = "", panel_pass: str = "") -> str:
+async def add_product(name, ptype, description="", panel_url="", panel_user="", panel_pass=""):
     db = _get_db()
-    doc = {
-        "name": name,
-        "type": ptype,
-        "description": description or "",
-        "panel_url": panel_url or "",
-        "panel_user": panel_user or "",
-        "panel_pass": panel_pass or "",
-        "is_active": 1,
-        "created_at": datetime.utcnow().isoformat(),
-    }
-    res = db.products.insert_one(doc)
+    res = db.products.insert_one({
+        "name": name, "type": ptype, "description": description or "",
+        "panel_url": panel_url or "", "panel_user": panel_user or "", "panel_pass": panel_pass or "",
+        "is_active": 1, "created_at": datetime.utcnow().isoformat(),
+    })
     return str(res.inserted_id)
 
-
-async def get_products(active_only=True) -> List[dict]:
+async def get_products(active_only=True):
     db = _get_db()
     q = {"is_active": 1} if active_only else {}
-    cur = db.products.find(q).sort("_id", DESCENDING)
-    return [_doc_id(d) for d in cur]
+    return [_doc_id(d) for d in db.products.find(q).sort("_id", DESCENDING)]
 
-
-async def get_product(pid) -> Optional[dict]:
-    db = _get_db()
+async def get_product(pid):
     oid = _oid(pid)
     if not oid:
         return None
-    doc = db.products.find_one({"_id": oid})
+    doc = _get_db().products.find_one({"_id": oid})
     return _doc_id(doc) if doc else None
 
-
 async def delete_product(pid):
-    db = _get_db()
     oid = _oid(pid)
     if oid:
-        db.products.update_one({"_id": oid}, {"$set": {"is_active": 0}})
+        _get_db().products.update_one({"_id": oid}, {"$set": {"is_active": 0}})
 
-
-# ── Variants ──────────────────────────────────────────────
-async def add_variant(product_id, label: str, duration_hours: float, price: float) -> str:
-    db = _get_db()
-    doc = {
-        "product_id": str(product_id),
-        "label": label,
-        "duration_hours": float(duration_hours),
-        "price": float(price),
-        "is_active": 1,
-    }
-    res = db.variants.insert_one(doc)
+async def add_variant(product_id, label, duration_hours, price):
+    res = _get_db().variants.insert_one({
+        "product_id": str(product_id), "label": label,
+        "duration_hours": float(duration_hours), "price": float(price), "is_active": 1,
+    })
     return str(res.inserted_id)
-
 
 async def seed_default_panel_variants(product_id):
     for label, hours, price in DEFAULT_PANEL_PLANS:
         await add_variant(product_id, label, hours, price)
 
-
-async def get_variants(product_id) -> List[dict]:
-    db = _get_db()
-    cur = db.variants.find({"product_id": str(product_id), "is_active": 1}).sort("_id", ASCENDING)
+async def get_variants(product_id):
+    cur = _get_db().variants.find({"product_id": str(product_id), "is_active": 1}).sort("_id", ASCENDING)
     return [_doc_id(d) for d in cur]
 
-
-async def get_variant(vid) -> Optional[dict]:
-    db = _get_db()
+async def get_variant(vid):
     oid = _oid(vid)
     if not oid:
         return None
-    doc = db.variants.find_one({"_id": oid})
+    doc = _get_db().variants.find_one({"_id": oid})
     return _doc_id(doc) if doc else None
 
-
 async def delete_variant(vid):
-    db = _get_db()
     oid = _oid(vid)
     if oid:
-        db.variants.update_one({"_id": oid}, {"$set": {"is_active": 0}})
+        _get_db().variants.update_one({"_id": oid}, {"$set": {"is_active": 0}})
 
-
-# ── Keys ──────────────────────────────────────────────────
-async def add_keys_bulk(product_id, variant_id, keys_text) -> int:
-    db = _get_db()
+async def add_keys_bulk(product_id, variant_id, keys_text):
     if isinstance(keys_text, str):
         lines = [ln.strip() for ln in keys_text.replace(",", "\n").splitlines() if ln.strip()]
     else:
         lines = [str(keys_text).strip()] if keys_text else []
     if not lines:
         return 0
-    docs = []
-    for k in lines:
-        docs.append({
-            "product_id": str(product_id),
-            "variant_id": str(variant_id) if variant_id else None,
-            "key_value": k,
-            "status": "available",
-            "used_at": None,
-            "used_order_id": None,
-            "expires_at": None,
-            "created_at": datetime.utcnow().isoformat(),
-        })
-    if docs:
-        db.keys.insert_many(docs)
+    docs = [{
+        "product_id": str(product_id),
+        "variant_id": str(variant_id) if variant_id else None,
+        "key_value": k, "status": "available",
+        "used_at": None, "used_order_id": None, "expires_at": None,
+        "created_at": datetime.utcnow().isoformat(),
+    } for k in lines]
+    _get_db().keys.insert_many(docs)
     return len(docs)
 
-
-async def get_stock(product_id, variant_id=None) -> int:
-    db = _get_db()
+async def get_stock(product_id, variant_id=None):
     q = {"product_id": str(product_id), "status": "available"}
     if variant_id is not None:
         q["variant_id"] = str(variant_id)
-    return db.keys.count_documents(q)
+    return _get_db().keys.count_documents(q)
 
-
-async def get_keys(product_id, limit=100) -> List[dict]:
-    db = _get_db()
-    cur = db.keys.find({"product_id": str(product_id)}).sort("_id", DESCENDING).limit(limit)
+async def get_keys(product_id, limit=100):
+    cur = _get_db().keys.find({"product_id": str(product_id)}).sort("_id", DESCENDING).limit(limit)
     return [_doc_id(d) for d in cur]
 
-
-async def claim_next_key(product_id, variant_id, order_id) -> Optional[str]:
-    db = _get_db()
+async def claim_next_key(product_id, variant_id, order_id):
     q = {
         "product_id": str(product_id),
         "variant_id": str(variant_id) if variant_id else None,
         "status": "available",
     }
-    doc = db.keys.find_one_and_update(
+    doc = _get_db().keys.find_one_and_update(
         q,
-        {"$set": {
-            "status": "used",
-            "used_at": datetime.utcnow().isoformat(),
-            "used_order_id": str(order_id),
-        }},
+        {"$set": {"status": "used", "used_at": datetime.utcnow().isoformat(), "used_order_id": str(order_id)}},
         sort=[("_id", ASCENDING)],
         return_document=ReturnDocument.AFTER,
     )
     return doc["key_value"] if doc else None
 
-
-# ── Orders ────────────────────────────────────────────────
-async def create_order(order_id: str, product_id, variant_id, amount: float, qr_url: str):
-    db = _get_db()
-    db.orders.insert_one({
-        "order_id": order_id,
-        "product_id": str(product_id),
+async def create_order(order_id, product_id, variant_id, amount, qr_url):
+    _get_db().orders.insert_one({
+        "order_id": order_id, "product_id": str(product_id),
         "variant_id": str(variant_id) if variant_id else None,
-        "amount": float(amount),
-        "status": "pending",
-        "qr_url": qr_url or "",
-        "delivered_key": None,
-        "delivered_type": None,
-        "transaction_id": None,
-        "utr": None,
-        "sender_name": None,
-        "payment_time": None,
-        "created_at": datetime.utcnow().isoformat(),
-        "paid_at": None,
+        "amount": float(amount), "status": "pending", "qr_url": qr_url or "",
+        "delivered_key": None, "delivered_type": None,
+        "transaction_id": None, "utr": None, "sender_name": None, "payment_time": None,
+        "created_at": datetime.utcnow().isoformat(), "paid_at": None,
     })
 
-
-async def get_order_by_api_id(order_id: str) -> Optional[dict]:
-    db = _get_db()
-    doc = db.orders.find_one({"order_id": order_id})
+async def get_order_by_api_id(order_id):
+    doc = _get_db().orders.find_one({"order_id": order_id})
     return _doc_id(doc) if doc else None
 
+async def mark_order_paid(order_id, transaction_id="", utr="", sender_name="", payment_time="",
+                          delivered_key="", delivered_type="key"):
+    _get_db().orders.update_one({"order_id": order_id}, {"$set": {
+        "status": "paid", "transaction_id": transaction_id or "", "utr": utr or "",
+        "sender_name": sender_name or "", "payment_time": payment_time or "",
+        "delivered_key": delivered_key or "", "delivered_type": delivered_type or "key",
+        "paid_at": datetime.utcnow().isoformat(),
+    }})
 
-async def mark_order_paid(order_id: str, transaction_id: str = "", utr: str = "",
-                          sender_name: str = "", payment_time: str = "",
-                          delivered_key: str = "", delivered_type: str = "key"):
-    db = _get_db()
-    db.orders.update_one(
-        {"order_id": order_id},
-        {"$set": {
-            "status": "paid",
-            "transaction_id": transaction_id or "",
-            "utr": utr or "",
-            "sender_name": sender_name or "",
-            "payment_time": payment_time or "",
-            "delivered_key": delivered_key or "",
-            "delivered_type": delivered_type or "key",
-            "paid_at": datetime.utcnow().isoformat(),
-        }},
-    )
-
-
-async def get_orders(limit=40) -> List[dict]:
-    db = _get_db()
-    cur = db.orders.find().sort("_id", DESCENDING).limit(limit)
+async def get_orders(limit=40):
     out = []
-    for d in cur:
+    for d in _get_db().orders.find().sort("_id", DESCENDING).limit(limit):
         row = _doc_id(d)
-        # attach product name if possible
-        if row.get("product_id"):
-            p = await get_product(row["product_id"])
-            row["product_name"] = p["name"] if p else None
-        else:
-            row["product_name"] = None
+        p = await get_product(row["product_id"]) if row.get("product_id") else None
+        row["product_name"] = p["name"] if p else None
         out.append(row)
     return out
 
@@ -465,10 +386,11 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
 
 @app.middleware("http")
 async def ensure_db(request: Request, call_next):
+    request.state.db_error = None
     try:
-        await init_db()
+        if MONGODB_URI and HAS_MONGO:
+            await init_db()
     except Exception as e:
-        # surface config errors on health only; still try to serve
         request.state.db_error = str(e)
     return await call_next(request)
 
@@ -481,12 +403,25 @@ def _redir_admin(pid=None, **qs):
             q.append(f"{k}={quote(str(v), safe='')}")
     return RedirectResponse("/adm-k9x2m7" + (("?" + "&".join(q)) if q else ""), status_code=303)
 
+def _err_page(msg: str) -> HTMLResponse:
+    return HTMLResponse(
+        f"""<!DOCTYPE html><html><body style="background:#0a0a0f;color:#eee;font-family:system-ui;padding:2rem">
+        <h1>Setup needed</h1><p style="color:#f87171">{msg}</p>
+        <p>Set <code>MONGODB_URI</code> on Vercel → Settings → Environment Variables, then Redeploy.</p>
+        <p><a href="/health" style="color:#818cf8">/health</a></p></body></html>""",
+        status_code=503,
+    )
+
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
+    if not MONGODB_URI:
+        return _err_page("MONGODB_URI is not set")
+    if not HAS_MONGO:
+        return _err_page("pymongo failed to import — check requirements.txt deploy")
     try:
         products = await get_products(active_only=True)
-    except Exception:
-        products = []
+    except Exception as e:
+        return _err_page(f"MongoDB error: {e}")
     for p in products:
         p["variants"] = await get_variants(p["id"])
         for v in p["variants"]:
@@ -525,7 +460,7 @@ async def pay_page(request: Request, order_id: str):
         return templates.TemplateResponse(request, "success.html", {"order": order, "product": product, "variant": variant})
     return templates.TemplateResponse(request, "payment.html", {
         "order": order, "product": product, "variant": variant,
-        "expiry_minutes": QR_EXPIRY_MINUTES, "poll_interval": POLL_INTERVAL_SECONDS
+        "expiry_minutes": QR_EXPIRY_MINUTES, "poll_interval": POLL_INTERVAL_SECONDS,
     })
 
 async def _deliver_for_paid_order(order, product, variant):
@@ -534,9 +469,7 @@ async def _deliver_for_paid_order(order, product, variant):
         return (key or "NO KEY – contact admin"), "key"
     hours = float(variant["duration_hours"]) if variant and variant.get("duration_hours") else 1.0
     return (await generate_key(
-        product.get("panel_url") or "",
-        product.get("panel_user") or "",
-        product.get("panel_pass") or "",
+        product.get("panel_url") or "", product.get("panel_user") or "", product.get("panel_pass") or "",
         hours=hours,
     )), "key"
 
@@ -562,13 +495,9 @@ async def check_payment(order_id: str):
     except PanelError as e:
         delivered_key, delivered_type = f"PAID but key failed: {e}", "error"
     await mark_order_paid(
-        order_id=order_id,
-        transaction_id=d.get("transaction_id", ""),
-        utr=d.get("utr", ""),
-        sender_name=d.get("sender_name", ""),
-        payment_time=d.get("payment_time_ist", ""),
-        delivered_key=delivered_key,
-        delivered_type=delivered_type,
+        order_id=order_id, transaction_id=d.get("transaction_id", ""), utr=d.get("utr", ""),
+        sender_name=d.get("sender_name", ""), payment_time=d.get("payment_time_ist", ""),
+        delivered_key=delivered_key, delivered_type=delivered_type,
     )
     return {"status": "paid", "delivered_key": delivered_key, "delivered_type": delivered_type}
 
@@ -583,14 +512,19 @@ async def success(request: Request, order_id: str):
 
 @app.get("/adm-k9x2m7", response_class=HTMLResponse)
 async def admin_home(request: Request, user: str = Depends(verify_admin)):
-    products = await get_products(active_only=False)
+    if not MONGODB_URI:
+        return _err_page("MONGODB_URI is not set")
+    try:
+        products = await get_products(active_only=False)
+    except Exception as e:
+        return _err_page(f"MongoDB error: {e}")
     for p in products:
         p["variants"] = await get_variants(p["id"])
         for v in p["variants"]:
             v["stock"] = -1 if p.get("type") == "panel" else await get_stock(p["id"], v["id"])
         p["total_stock"] = -1 if p.get("type") == "panel" else await get_stock(p["id"])
     return templates.TemplateResponse(request, "admin.html", {
-        "products": products, "orders": await get_orders(40), "upi_id": UPI_ID
+        "products": products, "orders": await get_orders(40), "upi_id": UPI_ID,
     })
 
 @app.post("/adm-k9x2m7/product/add")
@@ -632,10 +566,7 @@ async def admin_add_keys(
     return _redir_admin(product_id, added=await add_keys_bulk(product_id, variant_id, keys_text))
 
 @app.post("/adm-k9x2m7/keys/test")
-async def admin_gen_test(
-    product_id: str = Form(...), hours: float = Form(1.0),
-    user: str = Depends(verify_admin),
-):
+async def admin_gen_test(product_id: str = Form(...), hours: float = Form(1.0), user: str = Depends(verify_admin)):
     product = await get_product(product_id)
     if not product:
         return _redir_admin(error="not found")
@@ -643,10 +574,8 @@ async def admin_gen_test(
         return _redir_admin(product_id, error="panel only")
     try:
         key = await generate_key(
-            product.get("panel_url") or "",
-            product.get("panel_user") or "",
-            product.get("panel_pass") or "",
-            hours=hours,
+            product.get("panel_url") or "", product.get("panel_user") or "",
+            product.get("panel_pass") or "", hours=hours,
         )
     except PanelError as e:
         return _redir_admin(product_id, error=str(e))
@@ -666,26 +595,25 @@ async def admin_del_variant(vid: str, product_id: str = Form(...), user: str = D
 @app.get("/adm-k9x2m7/keys/{pid}", response_class=HTMLResponse)
 async def admin_view_keys(request: Request, pid: str, user: str = Depends(verify_admin)):
     return templates.TemplateResponse(request, "admin_keys.html", {
-        "product": await get_product(pid),
-        "keys": await get_keys(pid),
-        "variants": await get_variants(pid),
+        "product": await get_product(pid), "keys": await get_keys(pid), "variants": await get_variants(pid),
     })
 
 @app.get("/health")
 async def health():
-    ok = False
-    err = None
-    try:
-        await init_db()
-        _get_db().command("ping")
-        ok = True
-    except Exception as e:
-        err = str(e)
-    return {
-        "status": "ok" if ok else "db_error",
-        "mongo": ok,
-        "error": err,
+    info = {
+        "status": "ok", "has_mongo_lib": HAS_MONGO, "mongo_uri_set": bool(MONGODB_URI),
+        "upi_set": bool(UPI_ID), "api_key_set": bool(API_KEY),
         "time": datetime.utcnow().isoformat(),
-        "upi_set": bool(UPI_ID),
-        "api_key_set": bool(API_KEY),
     }
+    if MONGODB_URI and HAS_MONGO:
+        try:
+            _get_db().command("ping")
+            info["mongo"] = True
+        except Exception as e:
+            info["mongo"] = False
+            info["mongo_error"] = str(e)
+            info["status"] = "db_error"
+    else:
+        info["mongo"] = False
+        info["status"] = "config_error"
+    return info
